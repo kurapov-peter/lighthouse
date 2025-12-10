@@ -2,11 +2,12 @@
 
 import functools
 import math as pymath
+import os
 import pytest
 import torch
 
 
-from mlir import ir
+from mlir import ir, _mlir_libs
 from mlir.dialects import transform, func, linalg, tensor, arith, complex, math
 from mlir.dialects.linalg import ElementwiseKind
 from mlir.dialects.transform import structured, bufferization, interpreter
@@ -45,6 +46,23 @@ parallel = linalg.IteratorType.parallel
 reduction = linalg.IteratorType.reduction
 
 
+TILING_CONFIG = {
+    "linalg.contract": {
+        "tile_sizes": [32, 32],
+        "use_forall": True,
+        "fuse_producers": True,
+    }
+}
+
+CONTRACT_MATCHER = "__match_contract"
+CONTRACT_TILE_ACTION = "__tile_contract"
+
+RUNNER_UTILS_LIBS = [
+    os.path.join(os.path.dirname(_mlir_libs.__file__), "libmlir_c_runner_utils.so"),
+    os.path.join(os.path.dirname(_mlir_libs.__file__), "libmlir_runner_utils.so"),
+]
+
+
 def create_pass_pipeline(ctx: ir.Context) -> PassManager:
     pm = PassManager("builtin.module")
     pm.add("convert-scf-to-cf")
@@ -59,23 +77,68 @@ def create_pass_pipeline(ctx: ir.Context) -> PassManager:
     return pm
 
 
-def create_schedule() -> ir.Module:
+def create_schedule(payload: ir.Module) -> ir.Module:
     """
     Create an MLIR module containing transformation schedule.
     The schedule provides partial lowering to scalar operations.
 
     Args:
-        ctx: MLIR context.
+        payload: MLIR module that will consume this schedule. Used to
+            opportunistically enable transforms like tiling when matching
+            ops are present.
     """
+    contract_type = transform.OperationType.get("linalg.contract")
+    any_op_type = transform.AnyOpType.get()
+
     # Create transform module.
     schedule = ir.Module.create()
     schedule.operation.attributes["transform.with_named_sequence"] = ir.UnitAttr.get()
+
+    # Define matcher used by foreach_match to identify linalg.contract ops.
+    with ir.InsertionPoint(schedule.body):
+        contract_matcher = transform.named_sequence(
+            CONTRACT_MATCHER,
+            [any_op_type],
+            [contract_type],
+            arg_attrs=[{"transform.readonly": ir.UnitAttr.get()}],
+        )
+
+    with ir.InsertionPoint(contract_matcher.body):
+        matcher_target = contract_matcher.bodyTarget
+        matched_contract = transform.CastOp(contract_type, matcher_target)
+        transform.YieldOp(matched_contract)
+
+    # Define action that applies tiling/fusion to each matched linalg.contract.
+    with ir.InsertionPoint(schedule.body):
+        contract_tiler = transform.named_sequence(
+            CONTRACT_TILE_ACTION,
+            [contract_type],
+            [],
+        )
+
+    with ir.InsertionPoint(contract_tiler.body):
+        contract_handle = contract_tiler.bodyTarget
+        tiling_cfg = TILING_CONFIG["linalg.contract"]
+        tile_sizes = tiling_cfg["tile_sizes"]
+        if tiling_cfg["fuse_producers"]:
+            structured.FuseOp(
+                contract_handle,
+                tile_sizes=tile_sizes,
+                apply_cleanup=True,
+                use_forall=tiling_cfg["use_forall"],
+            )
+        else:
+            structured.TileUsingForOp(
+                contract_handle,
+                sizes=tile_sizes,
+            )
+        transform.YieldOp()
 
     # Create entry point transformation sequence.
     with ir.InsertionPoint(schedule.body):
         named_seq = transform.named_sequence(
             "__transform_main",
-            [transform.AnyOpType.get()],
+            [any_op_type],
             [],
             arg_attrs=[{"transform.readonly": ir.UnitAttr.get()}],
         )
@@ -91,10 +154,27 @@ def create_schedule() -> ir.Module:
         structured.structured_decompose_interface(anytype, softmax.results[0])
 
         # Find the kernel's module op.
-        func = structured.MatchOp.match_op_names(root, ["func.func"])
+        func = structured.MatchOp.match_op_names(root, ["func.func"]).result
         mod = transform.get_parent_op(
             anytype, func, op_name="builtin.module", deduplicate=True
         )
+
+        matcher_refs = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(CONTRACT_MATCHER)])
+        action_refs = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(CONTRACT_TILE_ACTION)])
+        transform.foreach_match(
+            updated=anytype,
+            forwarded_outputs=[],
+            root=func,
+            forwarded_inputs=[],
+            matchers=matcher_refs,
+            actions=action_refs,
+        )
+        func = structured.MatchOp.match_op_names(root, ["func.func"]).result
+        mod = transform.get_parent_op(
+            anytype, func, op_name="builtin.module", deduplicate=True
+        )
+
+        transform.PrintOp(target=mod, name="pre-bufferization")
 
         # Apply bufferization using OneShotBufferizeOp
         bufferized_mod = bufferization.OneShotBufferizeOp(
@@ -102,7 +182,7 @@ def create_schedule() -> ir.Module:
         )
 
         # Re-match function after bufferization since handles are invalidated
-        func = structured.MatchOp.match_op_names(bufferized_mod, ["func.func"])
+        func = structured.MatchOp.match_op_names(bufferized_mod, ["func.func"]).result
 
         # Use C interface wrappers - required to make function executable after jitting.
         func = transform.apply_registered_pass(anytype, func, "llvm-request-c-wrappers")
@@ -131,8 +211,14 @@ def apply_schedule(kernel: ir.Module, schedule: ir.Module) -> None:
         transform_root=schedule.body.operations[0],
         transform_module=schedule,
     )
+    print("\n// ----- IR after transform schedule -----")
+    print(kernel)
     pm = create_pass_pipeline(kernel.context)
     pm.run(kernel.operation)
+
+
+def create_execution_engine(module: ir.Module) -> ExecutionEngine:
+    return ExecutionEngine(module, opt_level=2, shared_libs=RUNNER_UTILS_LIBS)
 
 
 #### IR builders #####
@@ -1014,10 +1100,10 @@ def test_bin_op(op, shape, elem_type):
 
     ir_type = to_ir_type(elem_type)
     module = generate_module(ir_type)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("bin_op")
 
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
@@ -1070,10 +1156,10 @@ def test_unary_op(op, shape, elem_type):
 
     ir_type = to_ir_type(elem_type)
     module = generate_module(ir_type)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("unary_op")
 
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
@@ -1107,10 +1193,10 @@ def test_rms_norm(shape, elem_type):
 
     ir_type = to_ir_type(elem_type)
     module = generate_module(ir_type)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("rms_norm")
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
     a = torch.randn(*shape, dtype=torch_dtype)
@@ -1155,10 +1241,10 @@ def test_linear(shape, in_features, out_features):
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type, shape, in_features, out_features)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("linear_op")
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
     x = torch.randn(*shape, in_features, dtype=torch_dtype)
@@ -1196,10 +1282,10 @@ def test_polar():
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("polar_op")
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
     magnitude = torch.randn(4, 16, dtype=torch_dtype)
@@ -1231,10 +1317,10 @@ def test_repeat_kv():
     n_rep = 4
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type, n_rep)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("repeat_kv_op")
 
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
@@ -1269,10 +1355,10 @@ def test_reshape_for_broadcast():
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("reshape_for_broadcast")
 
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
@@ -1311,10 +1397,10 @@ def test_view_as_complex():
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("view_as_complex_op")
 
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
@@ -1347,10 +1433,10 @@ def test_view_as_real():
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("as_real_op")
 
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
@@ -1409,10 +1495,10 @@ def test_rotary_emb(batch_size, seq_len, n_heads, head_dim, n_kv_heads, elem_typ
         freqs_cis_shape=freqs_cis_shape,
         elty=ir_type,
     )
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("rotary_emb")
 
     out1 = torch.empty_like(xq_out)
@@ -1482,10 +1568,10 @@ def test_feed_forward():
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("feed_forward")
 
     torch_dtype = lh_utils.mlir_type_to_torch_dtype(ir_type)
@@ -1629,10 +1715,10 @@ def test_attention_fwd():
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type, model_args)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("attention_op")
 
     out = torch.empty_like(out_ref)
@@ -1769,10 +1855,10 @@ def test_transformer_block_fwd():
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type, model_args)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
 
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("transformer_block_op")
 
     out = torch.empty_like(out_ref)
@@ -1912,9 +1998,9 @@ def test_transformer_fwd():
 
     ir_type = to_ir_type("f32")
     module = generate_module(ir_type, model_args)
-    schedule = create_schedule()
+    schedule = create_schedule(module)
     apply_schedule(module, schedule)
-    eng = ExecutionEngine(module, opt_level=2)
+    eng = create_execution_engine(module)
     func_ptr = eng.lookup("transformer_op")
 
     reference = Transformer(model_args)
