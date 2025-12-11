@@ -18,21 +18,20 @@ def build_schedule() -> ir.Module:
         contract_matcher = transform.named_sequence(
             CONTRACT_MATCHER,
             [anytype],
-            [transform.OperationType.get("linalg.contract")],
+            [anytype],
             arg_attrs=[{"transform.readonly": ir.UnitAttr.get()}],
         )
 
     with ir.InsertionPoint(contract_matcher.body):
-        matched = structured.MatchOp(
-            transform.OperationType.get("linalg.contract"),
-            contract_matcher.bodyTarget,
-            ops=["linalg.contract"],
-        ).result
-        transform.yield_([matched])
+        transform.match_operation_name(contract_matcher.bodyTarget, {"linalg.contract"})
+        transform.yield_([contract_matcher.bodyTarget])
 
     with ir.InsertionPoint(schedule.body):
         transform_action = transform.named_sequence(
-            CONTRACT_ACTION, [anytype], [transform.OperationType.get("linalg.contract")]
+            CONTRACT_ACTION,
+            [transform.OperationType.get("linalg.contract")],
+            [],
+            arg_attrs=[{"transform.consumed": ir.UnitAttr.get()}],
         )
 
     with ir.InsertionPoint(transform_action.body):
