@@ -48,7 +48,7 @@ reduction = linalg.IteratorType.reduction
 
 TILING_CONFIG = {
     "linalg.contract": {
-        "tile_sizes": [32, 32],
+        "tile_sizes": [4, 4],
         "use_forall": True,
         "fuse_producers": True,
     }
@@ -94,19 +94,17 @@ def create_schedule(payload: ir.Module) -> ir.Module:
     schedule = ir.Module.create()
     schedule.operation.attributes["transform.with_named_sequence"] = ir.UnitAttr.get()
 
-    # Define matcher used by foreach_match to identify linalg.contract ops.
     with ir.InsertionPoint(schedule.body):
         contract_matcher = transform.named_sequence(
             CONTRACT_MATCHER,
             [any_op_type],
-            [contract_type],
+            [any_op_type],
             arg_attrs=[{"transform.readonly": ir.UnitAttr.get()}],
         )
 
     with ir.InsertionPoint(contract_matcher.body):
-        matcher_target = contract_matcher.bodyTarget
-        matched_contract = transform.CastOp(contract_type, matcher_target)
-        transform.YieldOp(matched_contract)
+        transform.match_operation_name(contract_matcher.bodyTarget, {"linalg.contract"})
+        transform.yield_([contract_matcher.bodyTarget])
 
     # Define action that applies tiling/fusion to each matched linalg.contract.
     with ir.InsertionPoint(schedule.body):
@@ -114,12 +112,14 @@ def create_schedule(payload: ir.Module) -> ir.Module:
             CONTRACT_TILE_ACTION,
             [contract_type],
             [],
+            arg_attrs=[{"transform.consumed": ir.UnitAttr.get()}],
         )
 
     with ir.InsertionPoint(contract_tiler.body):
-        contract_handle = contract_tiler.bodyTarget
         tiling_cfg = TILING_CONFIG["linalg.contract"]
         tile_sizes = tiling_cfg["tile_sizes"]
+        contract_handle = contract_tiler.bodyTarget
+
         if tiling_cfg["fuse_producers"]:
             structured.FuseOp(
                 contract_handle,
@@ -128,11 +128,8 @@ def create_schedule(payload: ir.Module) -> ir.Module:
                 use_forall=tiling_cfg["use_forall"],
             )
         else:
-            structured.TileUsingForOp(
-                contract_handle,
-                sizes=tile_sizes,
-            )
-        transform.YieldOp()
+            structured.TileUsingForOp(contract_handle, sizes=tile_sizes)
+        transform.yield_()
 
     # Create entry point transformation sequence.
     with ir.InsertionPoint(schedule.body):
@@ -158,6 +155,7 @@ def create_schedule(payload: ir.Module) -> ir.Module:
         mod = transform.get_parent_op(
             anytype, func, op_name="builtin.module", deduplicate=True
         )
+        transform.PrintOp(target=func, name="before-tiling")
 
         matcher_refs = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(CONTRACT_MATCHER)])
         action_refs = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(CONTRACT_TILE_ACTION)])
@@ -174,7 +172,7 @@ def create_schedule(payload: ir.Module) -> ir.Module:
             anytype, func, op_name="builtin.module", deduplicate=True
         )
 
-        transform.PrintOp(target=mod, name="pre-bufferization")
+        transform.PrintOp(target=mod, name="after-tiling")
 
         # Apply bufferization using OneShotBufferizeOp
         bufferized_mod = bufferization.OneShotBufferizeOp(
@@ -208,7 +206,7 @@ def create_schedule(payload: ir.Module) -> ir.Module:
 def apply_schedule(kernel: ir.Module, schedule: ir.Module) -> None:
     interpreter.apply_named_sequence(
         payload_root=kernel,
-        transform_root=schedule.body.operations[0],
+        transform_root=schedule.body.operations[-1],
         transform_module=schedule,
     )
     print("\n// ----- IR after transform schedule -----")
