@@ -50,7 +50,8 @@ TILING_CONFIG = {
     "linalg.contract": {
         "tile_sizes": [4, 4],
         "use_forall": True,
-        "fuse_producers": True,
+        "fuse_producers": False,
+        "fuse_consumers": True,
     }
 }
 
@@ -127,6 +128,19 @@ def create_schedule(payload: ir.Module) -> ir.Module:
                 apply_cleanup=True,
                 use_forall=tiling_cfg["use_forall"],
             )
+        elif tiling_cfg["fuse_consumers"]:
+            tiled = structured.TileUsingForallOp(contract_handle, tile_sizes=tile_sizes)
+
+            consumers = transform.get_consumers_of_result(
+                any_op_type, tiled.results[0], 0
+            )
+            transform.PrintOp(target=consumers, name="consumers_before_fusion")
+            structured.FuseIntoContainingOp(
+                any_op_type,
+                any_op_type,
+                consumers,
+                tiled.results[1],
+            )
         else:
             structured.TileUsingForOp(contract_handle, sizes=tile_sizes)
         transform.yield_()
@@ -200,6 +214,8 @@ def create_schedule(payload: ir.Module) -> ir.Module:
 
         # Terminate the schedule.
         transform.YieldOp()
+    print("\n// ----- Transform schedule -----")
+    print(schedule)
     return schedule
 
 
