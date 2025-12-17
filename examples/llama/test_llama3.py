@@ -8,7 +8,7 @@ import torch
 
 
 from mlir import ir, _mlir_libs
-from mlir.dialects import transform, func, linalg, tensor, arith, complex, math
+from mlir.dialects import transform, func, linalg, tensor, arith, complex, math, memref
 from mlir.dialects.linalg import ElementwiseKind
 from mlir.dialects.transform import structured, bufferization, interpreter
 from mlir.passmanager import PassManager
@@ -47,12 +47,23 @@ reduction = linalg.IteratorType.reduction
 
 
 TILING_CONFIG = {
+    "enabled": True,
     "linalg.contract": {
         "tile_sizes": [4, 4],
         "use_forall": True,
-        "fuse_producers": False,
-        "fuse_consumers": True,
-    }
+        "fuse_producers": True,
+        "fuse_consumers": False,
+    },
+    "linalg.elementwise": {
+        "tile_sizes": [4, 4],
+        "use_forall": True,
+        "fuse_producers": True,
+        "fuse_consumers": False,
+    },
+}
+
+VECTOR_CONFIG = {
+    "enabled": True,
 }
 
 CONTRACT_MATCHER = "__match_contract"
@@ -65,17 +76,23 @@ RUNNER_UTILS_LIBS = [
 
 
 def create_pass_pipeline(ctx: ir.Context) -> PassManager:
-    pm = PassManager("builtin.module")
-    pm.add("convert-scf-to-cf")
-    pm.add("expand-strided-metadata")
-    pm.add("lower-affine")
-    pm.add("finalize-memref-to-llvm")
-    pm.add("convert-func-to-llvm")
-    pm.add("convert-to-llvm")
-    pm.add("reconcile-unrealized-casts")
-    pm.add("cse")
-    pm.add("canonicalize")
-    return pm
+    pipeline = (
+        "builtin.module("
+        "convert-vector-to-scf,"
+        "func.func(lower-vector-multi-reduction),"
+        "convert-scf-to-cf,"
+        "expand-strided-metadata,"
+        "lower-affine,"
+        "finalize-memref-to-llvm,"
+        "convert-func-to-llvm,"
+        "canonicalize,"
+        "convert-to-llvm,"
+        "reconcile-unrealized-casts,"
+        "cse,"
+        "canonicalize"
+        ")"
+    )
+    return PassManager.parse(pipeline, ctx)
 
 
 def create_schedule(payload: ir.Module) -> ir.Module:
@@ -117,33 +134,76 @@ def create_schedule(payload: ir.Module) -> ir.Module:
         )
 
     with ir.InsertionPoint(contract_tiler.body):
-        tiling_cfg = TILING_CONFIG["linalg.contract"]
-        tile_sizes = tiling_cfg["tile_sizes"]
-        contract_handle = contract_tiler.bodyTarget
-
-        if tiling_cfg["fuse_producers"]:
-            structured.FuseOp(
-                contract_handle,
-                tile_sizes=tile_sizes,
-                apply_cleanup=True,
-                use_forall=tiling_cfg["use_forall"],
-            )
-        elif tiling_cfg["fuse_consumers"]:
-            tiled = structured.TileUsingForallOp(contract_handle, tile_sizes=tile_sizes)
-
-            consumers = transform.get_consumers_of_result(
-                any_op_type, tiled.results[0], 0
-            )
-            transform.PrintOp(target=consumers, name="consumers_before_fusion")
-            structured.FuseIntoContainingOp(
-                any_op_type,
-                any_op_type,
-                consumers,
-                tiled.results[1],
-            )
+        if not TILING_CONFIG["enabled"]:
+            transform.yield_()
         else:
-            structured.TileUsingForOp(contract_handle, sizes=tile_sizes)
-        transform.yield_()
+            tiling_cfg = TILING_CONFIG["linalg.contract"]
+            tile_sizes = tiling_cfg["tile_sizes"]
+            contract_handle = contract_tiler.bodyTarget
+
+            if tiling_cfg["fuse_producers"]:
+                # TODO: fuse op currently fails.
+                # structured.FuseOp(
+                #     contract_handle,
+                #     tile_sizes=tile_sizes,
+                #     apply_cleanup=True,
+                #     use_forall=tiling_cfg["use_forall"],
+                # )
+                tiled = structured.TileUsingForallOp(
+                    contract_handle, tile_sizes=tile_sizes
+                )
+                transform.PrintOp(target=tiled.results[1], name="tiled loop")
+
+                producers = transform.get_producer_of_operand(
+                    any_op_type, tiled.results[1], 0
+                )
+                transform.PrintOp(target=producers, name="producers_before_fusion")
+                structured.FuseIntoContainingOp(producers, tiled.results[1])
+
+                # if VECTOR_CONFIG["enabled"]:
+                #     # Vectorize the tiled contract op(s) inside the forall.
+                #     inner_contracts = structured.MatchOp(
+                #         any_op_type, tiled.results[1], ops=["linalg.contract"]
+                #     )
+                #     structured.VectorizeOp(inner_contracts.results[0])
+
+            elif tiling_cfg["fuse_consumers"]:
+                tiled = structured.TileUsingForallOp(
+                    contract_handle, tile_sizes=tile_sizes
+                )
+                transform.PrintOp(target=tiled.results[1], name="tiled loop")
+
+                if VECTOR_CONFIG["enabled"]:
+                    inner_contracts = structured.MatchOp(
+                        any_op_type, tiled.results[1], ops=["linalg.contract"]
+                    )
+                    structured.VectorizeOp(inner_contracts.results[0])
+
+                # TODO: consumer fusion through transform is not exposed yet.
+                # consumers = transform.get_consumers_of_result(
+                #     any_op_type, tiled.results[1], 0
+                # )
+                # transform.PrintOp(target=consumers, name="consumers_before_fusion")
+                # structured.test.fuse_consumer(consumers, tiled.results[1])
+
+            else:
+                if tiling_cfg["use_forall"]:
+                    tiled = structured.TileUsingForallOp(
+                        contract_handle, tile_sizes=tile_sizes
+                    )
+                    if VECTOR_CONFIG["enabled"]:
+                        inner_contracts = structured.MatchOp(
+                            any_op_type, tiled.results[1], ops=["linalg.contract"]
+                        )
+                        structured.VectorizeOp(inner_contracts.results[0])
+                else:
+                    tiled = structured.TileUsingForOp(contract_handle, sizes=tile_sizes)
+                    if VECTOR_CONFIG["enabled"]:
+                        inner_contracts = structured.MatchOp(
+                            any_op_type, tiled.results[1], ops=["linalg.contract"]
+                        )
+                        structured.VectorizeOp(inner_contracts.results[0])
+            transform.yield_()
 
     # Create entry point transformation sequence.
     with ir.InsertionPoint(schedule.body):
@@ -157,24 +217,23 @@ def create_schedule(payload: ir.Module) -> ir.Module:
     # Create the schedule.
     with ir.InsertionPoint(named_seq.body):
         # For simplicity, use generic transform matchers.
-        anytype = transform.AnyOpType.get()
         root = named_seq.bodyTarget
 
         # Match and decompose softmax operations before bufferization
-        softmax = structured.MatchOp(anytype, root, ops=["linalg.softmax"])
-        structured.structured_decompose_interface(anytype, softmax.results[0])
+        softmax = structured.MatchOp(any_op_type, root, ops=["linalg.softmax"])
+        structured.structured_decompose_interface(any_op_type, softmax.results[0])
 
         # Find the kernel's module op.
         func = structured.MatchOp.match_op_names(root, ["func.func"]).result
         mod = transform.get_parent_op(
-            anytype, func, op_name="builtin.module", deduplicate=True
+            any_op_type, func, op_name="builtin.module", deduplicate=True
         )
         transform.PrintOp(target=func, name="before-tiling")
 
         matcher_refs = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(CONTRACT_MATCHER)])
         action_refs = ir.ArrayAttr.get([ir.FlatSymbolRefAttr.get(CONTRACT_TILE_ACTION)])
         transform.foreach_match(
-            updated=anytype,
+            updated=any_op_type,
             forwarded_outputs=[],
             root=func,
             forwarded_inputs=[],
@@ -183,31 +242,51 @@ def create_schedule(payload: ir.Module) -> ir.Module:
         )
         func = structured.MatchOp.match_op_names(root, ["func.func"]).result
         mod = transform.get_parent_op(
-            anytype, func, op_name="builtin.module", deduplicate=True
+            any_op_type, func, op_name="builtin.module", deduplicate=True
         )
 
         transform.PrintOp(target=mod, name="after-tiling")
 
+        func = transform.apply_registered_pass(
+            any_op_type, func, "linalg-fuse-elementwise-ops"
+        )
+
+        transform.PrintOp(target=func, name="after-fuse-elementwise")
+
+        # func = structured.structured_vectorize_children_and_apply_patterns(
+        #     target=func, fold_type_extensions_into_contract=True
+        # ).result
+        if VECTOR_CONFIG["enabled"]:
+            func = structured.VectorizeChildrenAndApplyPatternsOp(
+                func, fold_type_extensions_into_contract=True
+            ).result
+            transform.PrintOp(target=mod, name="after-vectorization")
+
         # Apply bufferization using OneShotBufferizeOp
         bufferized_mod = bufferization.OneShotBufferizeOp(
-            anytype, mod, bufferize_function_boundaries=True
+            any_op_type, mod, bufferize_function_boundaries=True
         )
 
         # Re-match function after bufferization since handles are invalidated
         func = structured.MatchOp.match_op_names(bufferized_mod, ["func.func"]).result
 
-        # Use C interface wrappers - required to make function executable after jitting.
-        func = transform.apply_registered_pass(anytype, func, "llvm-request-c-wrappers")
+        # transform.PrintOp(target=func, name="after-bufferization")
+
+        func = transform.apply_registered_pass(
+            any_op_type, func, "llvm-request-c-wrappers"
+        )
         mod = transform.get_parent_op(
-            anytype, func, op_name="builtin.module", deduplicate=True
+            any_op_type, func, op_name="builtin.module", deduplicate=True
         )
 
-        # Naive lowering to loops.
+        # Lower to loops inside the schedule (after optional vectorization).
+        # This makes the schedule output contain explicit loop nests.
         mod_loops = transform.apply_registered_pass(
-            anytype, mod, "convert-linalg-to-loops"
+            any_op_type, mod, "convert-linalg-to-loops"
         )
 
-        # Cleanup.
+        # Keep vector ops for proper vector-to-LLVM lowering (SIMD).
+
         transform.apply_cse(mod_loops)
         with ir.InsertionPoint(transform.ApplyPatternsOp(mod_loops).patterns):
             transform.ApplyCanonicalizationPatternsOp()
@@ -229,6 +308,19 @@ def apply_schedule(kernel: ir.Module, schedule: ir.Module) -> None:
     print(kernel)
     pm = create_pass_pipeline(kernel.context)
     pm.run(kernel.operation)
+    print("\n// ----- IR after pass pipeline -----")
+    print(kernel)
+
+
+def inject_keepalive_anchor(result_tensor: ir.Value) -> None:
+    tensor_ty = ir.RankedTensorType(result_tensor.type)
+    zero_idx = arith.constant(ir.IndexType.get(), 0)
+    indices = [zero_idx] * tensor_ty.rank
+
+    extracted = tensor.extract(result_tensor, indices)
+    scalar_memref_ty = ir.MemRefType.get([], tensor_ty.element_type)
+    tmp = memref.alloca(scalar_memref_ty, [], [])
+    memref.store(extracted, tmp, [])
 
 
 def create_execution_engine(module: ir.Module) -> ExecutionEngine:
@@ -1249,7 +1341,8 @@ def test_linear(shape, in_features, out_features):
                 input_type, weight_type, bias_type, output_type, name="linear_op"
             )
             def linear_op(x, w, b, out):
-                get_linear(x, w, b, out)
+                result = get_linear(x, w, b, out)
+                inject_keepalive_anchor(result)
 
         return module
 
